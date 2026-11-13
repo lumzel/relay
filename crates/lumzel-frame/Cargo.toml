@@ -1,0 +1,15 @@
+[package]
+name = "lumzel-frame"
+version = "0.1.0"
+edition = "2021"
+description = "Host link wire frame: header, sequence numbers and ChaCha20-Poly1305 under handshake keys"
+publish = false
+
+[dependencies]
+x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
+chacha20poly1305 = "0.10.1"
+rand = "0.8.5"
+sha2 = "0.10.8"
+subtle = "2.6.1"
+thiserror = "2.0.12"
+

@@ -1,0 +1,13 @@
+services:
+  relay:
+    image: ghcr.io/lumzel/relay:latest
+    container_name: lumzel-relay
+    restart: unless-stopped
+    environment:
+      - RELAY_BIND=0.0.0.0:8080
+      - RELAY_STUN_BIND=0.0.0.0:3478,0.0.0.0:3479
+      - RELAY_NODE_ID=main
+    ports:
+      - "8080:8080"
+      - "3478:3478/udp"
+      - "3479:3479/udp"
