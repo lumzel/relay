@@ -14,13 +14,18 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{watch, Notify};
-use tokio::time::Sleep;
+use tokio::time::{Instant, Sleep};
 
 use crate::handshake;
 use crate::limits::{ChargeOutcome, HandshakeWatch, PeerAddr, RouteLimitGuard, SharedIpPermit};
 use crate::ops::AppState;
 use crate::punch;
 use crate::routes::{ConnId, Outbound, Plane, RouteError, Side};
+
+const MAX_WS_MSG: usize = 4 * 1024 * 1024;
+const LOCAL_TX_CAP: usize = 64;
+const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub async fn ws(
     ws: WebSocketUpgrade,
@@ -48,11 +53,13 @@ pub(crate) fn accept(
     let failed = state.clone();
     let failed_ip = ip_permit.clone();
     let task = state;
-    ws.on_failed_upgrade(move |_| {
-        failed_ip.release();
-        failed.lock().unreserve();
-    })
-    .on_upgrade(move |socket| run_socket(socket, task, plane, ip_permit))
+    ws.max_message_size(MAX_WS_MSG)
+        .max_frame_size(MAX_WS_MSG)
+        .on_failed_upgrade(move |_| {
+            failed_ip.release();
+            failed.lock().unreserve();
+        })
+        .on_upgrade(move |socket| run_socket(socket, task, plane, ip_permit))
 }
 
 struct Admission {
@@ -64,12 +71,14 @@ struct Admission {
 impl Drop for Admission {
     fn drop(&mut self) {
         let id = self.id.swap(0, Ordering::SeqCst);
-        let mut table = self.state.lock();
-        if let Some(conn) = ConnId::from_raw(id) {
-            table.release(conn);
+        {
+            let mut table = self.state.lock();
+            if let Some(conn) = ConnId::from_raw(id) {
+                table.release(conn);
+            }
+            table.unreserve();
         }
         self.ip_permit.release();
-        table.unreserve();
     }
 }
 
@@ -90,7 +99,7 @@ pub(crate) async fn run_socket(
         id: Arc::clone(&id_slot),
     };
     let (mut sink, mut stream) = socket.split();
-    let (local_tx, mut local_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    let (local_tx, mut local_rx) = tokio::sync::mpsc::channel::<Message>(LOCAL_TX_CAP);
 
     let writer = {
         let state = state.clone();
@@ -103,16 +112,28 @@ pub(crate) async fn run_socket(
                     let batch = state.lock().take_outbound(id);
                     match batch {
                         None => {
-                            let _ = sink.send(Message::Close(None)).await;
-                            let _ = sink.close().await;
+                            let _ = tokio::time::timeout(
+                                CLOSE_TIMEOUT,
+                                sink.send(Message::Close(None)),
+                            )
+                            .await;
+                            let _ = tokio::time::timeout(CLOSE_TIMEOUT, sink.close()).await;
                             let _ = writer_done_tx.send(true);
                             return;
                         }
                         Some(items) if !items.is_empty() => {
                             for item in items {
-                                if sink.send(outbound_message(item)).await.is_err() {
-                                    let _ = writer_done_tx.send(true);
-                                    return;
+                                match tokio::time::timeout(
+                                    WRITE_TIMEOUT,
+                                    sink.send(outbound_message(item)),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(_)) | Err(_) => {
+                                        let _ = writer_done_tx.send(true);
+                                        return;
+                                    }
                                 }
                             }
                             continue;
@@ -120,22 +141,30 @@ pub(crate) async fn run_socket(
                         Some(_) => {}
                     }
                 }
-                let route_notify = notify_slot.lock().expect("notify").clone();
+                let route_notify = notify_slot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
                 tokio::select! {
                     biased;
                     incoming = local_rx.recv() => {
                         match incoming {
                             Some(msg) => {
                                 let is_close = matches!(msg, Message::Close(_));
-                                if sink.send(msg).await.is_err() || is_close {
-                                    let _ = sink.close().await;
+                                let limit = if is_close { CLOSE_TIMEOUT } else { WRITE_TIMEOUT };
+                                let send_ok = matches!(
+                                    tokio::time::timeout(limit, sink.send(msg)).await,
+                                    Ok(Ok(()))
+                                );
+                                if !send_ok || is_close {
+                                    let _ = tokio::time::timeout(CLOSE_TIMEOUT, sink.close()).await;
                                     let _ = writer_done_tx.send(true);
                                     return;
                                 }
                             }
                             None => {
-                                let _ = sink.send(Message::Close(None)).await;
-                                let _ = sink.close().await;
+                                let _ = tokio::time::timeout(CLOSE_TIMEOUT, sink.send(Message::Close(None))).await;
+                                let _ = tokio::time::timeout(CLOSE_TIMEOUT, sink.close()).await;
                                 let _ = writer_done_tx.send(true);
                                 return;
                             }
@@ -152,10 +181,16 @@ pub(crate) async fn run_socket(
         let mut bound: Option<(String, String)> = None;
         let mut _route_guard: Option<RouteLimitGuard> = None;
         let mut handshake_state: Option<(Pin<Box<Sleep>>, Arc<HandshakeWatch>)> = None;
+        let pre_hello_dur = state.limits().pre_hello_timeout();
+        let idle_dur = state.limits().idle_timeout();
+        let activity_sleep = tokio::time::sleep(pre_hello_dur);
+        tokio::pin!(activity_sleep);
+
         loop {
             let next = tokio::select! {
                 biased;
                 _ = writer_done_rx.changed() => break,
+                _ = &mut activity_sleep => break,
                 timed_out = poll_handshake(&mut handshake_state) => {
                     if timed_out {
                         break;
@@ -171,6 +206,9 @@ pub(crate) async fn run_socket(
                 Ok(msg) => msg,
                 Err(_) => break,
             };
+            if bound.is_some() {
+                activity_sleep.as_mut().reset(Instant::now() + idle_dur);
+            }
             match msg {
                 Message::Binary(bytes) => {
                     let Some((host, sid)) = bound.clone() else {
@@ -231,7 +269,7 @@ pub(crate) async fn run_socket(
                             Side::Host
                         } else {
                             if !state.inbox_lock().is_registered(&hello.host) {
-                                let _ = local_tx.send(Message::Close(Some(CloseFrame {
+                                let _ = local_tx.try_send(Message::Close(Some(CloseFrame {
                                     code: 4404,
                                     reason: "host offline".into(),
                                 })));
@@ -252,7 +290,10 @@ pub(crate) async fn run_socket(
                                         None
                                     };
                                     let _ = table.forward_text(id, &forwarded);
-                                    notify_slot.lock().expect("notify").replace(notify);
+                                    notify_slot
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                        .replace(notify);
                                     id_slot.store(id.raw(), Ordering::SeqCst);
                                     (false, host_absent, watch)
                                 }
@@ -267,7 +308,7 @@ pub(crate) async fn run_socket(
                                 .inbox_lock()
                                 .notify_waiting(&hello.host, &hello.sid, plane)
                         {
-                            let _ = local_tx.send(Message::Close(Some(CloseFrame {
+                            let _ = local_tx.try_send(Message::Close(Some(CloseFrame {
                                 code: 4404,
                                 reason: "host offline".into(),
                             })));
@@ -280,6 +321,7 @@ pub(crate) async fn run_socket(
                         }
                         wake.notify_one();
                         bound = Some((hello.host, hello.sid));
+                        activity_sleep.as_mut().reset(Instant::now() + idle_dur);
                         continue;
                     }
                     if plane != Plane::Control {
@@ -313,7 +355,9 @@ pub(crate) async fn run_socket(
                     }
                 }
                 Message::Ping(payload) => {
-                    if local_tx.send(Message::Pong(payload)).is_err() {
+                    if let Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) =
+                        local_tx.try_send(Message::Pong(payload))
+                    {
                         break;
                     }
                 }

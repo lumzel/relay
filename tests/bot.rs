@@ -330,3 +330,248 @@ async fn authorize_page_renders_template_with_html_escaped_host_name() {
     assert!(html.contains("/mcp/"));
     assert!(html.contains("/authorize/status"));
 }
+
+#[tokio::test]
+async fn cross_host_http_res_spoofing_is_rejected_and_isolated() {
+    let (addr, _) = spawn().await;
+    let host_a = Identity::generate();
+    let host_b = Identity::generate();
+    let (mut inbox_a, hid_a) = register_host(addr, &host_a, true).await;
+    let (mut inbox_b, _hid_b) = register_host(addr, &host_b, true).await;
+
+    let target_hid = hid_a.clone();
+    let client_task = tokio::spawn(async move {
+        send_http(addr, "POST", &format!("/mcp/{target_hid}"), &[], b"{}").await
+    });
+
+    let msg = read_json(&mut inbox_a).await;
+    let req_id = msg["id"].as_u64().unwrap();
+
+    // Host B attempts to hijack Host A's pending HTTP request id.
+    let spoofed = json!({
+        "t": "http_res",
+        "id": req_id,
+        "status": 200,
+        "headers": { "Content-Type": "application/json" },
+        "body": B64.encode(br#"{"hijacked":true}"#),
+    });
+    inbox_b
+        .send(Message::text(spoofed.to_string()))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    // Even disconnecting Host B must not cancel or drop Host A's pending request.
+    let _ = inbox_b.close(None).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(!client_task.is_finished());
+
+    // Host A answers legitimately.
+    let genuine = json!({
+        "t": "http_res",
+        "id": req_id,
+        "status": 200,
+        "headers": { "Content-Type": "application/json" },
+        "body": B64.encode(br#"{"ok":true}"#),
+    });
+    inbox_a
+        .send(Message::text(genuine.to_string()))
+        .await
+        .unwrap();
+
+    let (status, _, body) = client_task.await.unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(String::from_utf8(body).unwrap(), r#"{"ok":true}"#);
+}
+
+#[tokio::test]
+async fn authorize_template_escapes_js_breakout_and_sets_security_headers() {
+    let (addr, _) = spawn().await;
+    let host_identity = Identity::generate();
+    let (mut inbox, hid) = register_host(addr, &host_identity, true).await;
+
+    let target_hid = hid.clone();
+    let client_task = tokio::spawn(async move {
+        send_http(
+            addr,
+            "GET",
+            &format!("/mcp/{target_hid}/authorize?client_id=chatgpt"),
+            &[],
+            b"",
+        )
+        .await
+    });
+
+    let msg = read_json(&mut inbox).await;
+    let req_id = msg["id"].as_u64().unwrap();
+
+    let auth_data = json!({
+        "request": "req\";</script><script>alert(1)//",
+        "host_name": "<img src=x onerror=alert(1)>",
+        "user_code": "849201"
+    });
+    let reply = json!({
+        "t": "http_res",
+        "id": req_id,
+        "status": 200,
+        "headers": { "Content-Type": "application/json" },
+        "body": B64.encode(auth_data.to_string().as_bytes()),
+    });
+    inbox.send(Message::text(reply.to_string())).await.unwrap();
+
+    let (status, res_headers, body) = client_task.await.unwrap();
+    assert_eq!(status, 200);
+    let csp = res_headers.get("content-security-policy").unwrap();
+    assert!(csp.contains("default-src 'none'"), "{csp}");
+    assert!(csp.contains("script-src 'nonce-"), "{csp}");
+    assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+    assert_eq!(res_headers.get("x-frame-options").unwrap(), "DENY");
+    assert_eq!(
+        res_headers.get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    assert_eq!(res_headers.get("referrer-policy").unwrap(), "no-referrer");
+    assert_eq!(res_headers.get("cache-control").unwrap(), "no-store");
+
+    let html = String::from_utf8(body).unwrap();
+    assert!(!html.contains("</script><script>alert(1)"), "{html}");
+    assert!(html.contains("\\u003c\\/script\\u003e"), "{html}");
+    assert!(html.contains("encodeURIComponent(hostId)"));
+    assert!(html.contains("isSafeRedirect("));
+}
+
+#[tokio::test]
+async fn authorize_invalid_json_unsafe_content_type_and_bad_base64_are_blocked() {
+    let (addr, _) = spawn().await;
+    let host_identity = Identity::generate();
+    let (mut inbox, hid) = register_host(addr, &host_identity, true).await;
+
+    // 1. /authorize returning non-JSON HTML must return 502, never passthrough raw HTML.
+    let target_hid = hid.clone();
+    let t1 = tokio::spawn(async move {
+        send_http(
+            addr,
+            "GET",
+            &format!("/mcp/{target_hid}/authorize"),
+            &[],
+            b"",
+        )
+        .await
+    });
+    let msg = read_json(&mut inbox).await;
+    inbox
+        .send(Message::text(
+            json!({
+                "t": "http_res",
+                "id": msg["id"],
+                "status": 200,
+                "headers": { "Content-Type": "text/html" },
+                "body": B64.encode(b"<script>alert(1)</script>"),
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let (status, _, _) = t1.await.unwrap();
+    assert_eq!(status, 502);
+
+    // 2. Normal MCP endpoint strips unsafe text/html Content-Type and sets nosniff + X-Frame-Options.
+    let target_hid = hid.clone();
+    let t2 = tokio::spawn(async move {
+        send_http(addr, "POST", &format!("/mcp/{target_hid}"), &[], b"{}").await
+    });
+    let msg = read_json(&mut inbox).await;
+    inbox
+        .send(Message::text(
+            json!({
+                "t": "http_res",
+                "id": msg["id"],
+                "status": 200,
+                "headers": { "Content-Type": "text/html; charset=utf-8" },
+                "body": B64.encode(b"ok"),
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let (status, headers, _) = t2.await.unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some("application/octet-stream")
+    );
+    assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
+    assert_eq!(headers.get("x-frame-options").unwrap(), "DENY");
+
+    // 3. Invalid base64 body from Host returns 502 instead of silent empty 200.
+    let target_hid = hid.clone();
+    let t3 = tokio::spawn(async move {
+        send_http(addr, "POST", &format!("/mcp/{target_hid}"), &[], b"{}").await
+    });
+    let msg = read_json(&mut inbox).await;
+    inbox
+        .send(Message::text(
+            json!({
+                "t": "http_res",
+                "id": msg["id"],
+                "status": 200,
+                "headers": { "Content-Type": "application/json" },
+                "body": "!!!not-valid-base64!!!",
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let (status, _, _) = t3.await.unwrap();
+    assert_eq!(status, 502);
+}
+
+#[tokio::test]
+async fn http_rate_limit_and_drain_block_bot_endpoints() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = AppState::new("local", 1024)
+        .with_ops_token("drain-secret")
+        .with_limits(lumzel_relay::LimitsConfig {
+            http_req_per_sec: 1,
+            ..lumzel_relay::LimitsConfig::default()
+        });
+    let bg = state.clone();
+    tokio::spawn(async move {
+        lumzel_relay::serve(listener, bg).await.unwrap();
+    });
+
+    let host_identity = Identity::generate();
+    let (_inbox, hid) = register_host(addr, &host_identity, true).await;
+
+    // Burst is max(rate * 2, 10) = 10; rapid requests beyond burst must receive 429.
+    let mut saw_429 = false;
+    for _ in 0..16 {
+        let (status, _, _) = send_http(
+            addr,
+            "GET",
+            "/.well-known/oauth-protected-resource/mcp/other-host",
+            &[],
+            b"",
+        )
+        .await;
+        if status == 429 {
+            saw_429 = true;
+            break;
+        }
+    }
+    assert!(saw_429, "expected 429 from per-IP HTTP rate limiter");
+
+    // Draining returns 503 on Bot HTTP endpoints.
+    let (drain_status, _, _) = send_http(
+        addr,
+        "POST",
+        "/drain",
+        &[("Authorization", "Bearer drain-secret")],
+        b"",
+    )
+    .await;
+    assert_eq!(drain_status, 204);
+    let (status, _, _) = send_http(addr, "POST", &format!("/mcp/{hid}"), &[], b"{}").await;
+    assert_eq!(status, 503);
+}

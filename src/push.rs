@@ -1,7 +1,11 @@
 // lumzel:mobile-companion#relay-push
 //! Wake hint only. No title, body, or path. Absent keys means push does not exist.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+
+const MAX_LOG_ENTRIES: usize = 1024;
+const MAX_WAKE_PAYLOAD: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Wake {
@@ -22,7 +26,7 @@ pub struct Sender {
 
 struct Inner {
     available: bool,
-    log: Mutex<Vec<Wake>>,
+    log: Mutex<VecDeque<Wake>>,
 }
 
 impl Sender {
@@ -45,7 +49,7 @@ impl Sender {
         Self {
             inner: Arc::new(Inner {
                 available,
-                log: Mutex::new(Vec::new()),
+                log: Mutex::new(VecDeque::new()),
             }),
         }
     }
@@ -61,12 +65,24 @@ impl Sender {
         if !valid_host(&wake.host_id) {
             return Err(PushError::BadPayload);
         }
-        self.inner.log.lock().expect("push log").push(wake);
+        let mut log = self
+            .inner
+            .log
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if log.len() >= MAX_LOG_ENTRIES {
+            log.pop_front();
+        }
+        log.push_back(wake);
         Ok(())
     }
 
     pub(crate) fn recorded(&self) -> String {
-        let log = self.inner.log.lock().expect("push log");
+        let log = self
+            .inner
+            .log
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut out = String::new();
         for wake in log.iter() {
             out.push_str(&wake.host_id);
@@ -87,6 +103,9 @@ pub(crate) fn accept(sender: &Sender, body: &[u8]) -> Result<(), PushError> {
 }
 
 fn parse_wake(body: &[u8]) -> Result<Wake, PushError> {
+    if body.len() > MAX_WAKE_PAYLOAD {
+        return Err(PushError::BadPayload);
+    }
     let value: serde_json::Value =
         serde_json::from_slice(body).map_err(|_| PushError::BadPayload)?;
     let obj = value.as_object().ok_or(PushError::BadPayload)?;
@@ -108,5 +127,5 @@ fn parse_wake(body: &[u8]) -> Result<Wake, PushError> {
 }
 
 fn valid_host(host_id: &str) -> bool {
-    (1..=256).contains(&host_id.len())
+    crate::routes::valid_route_id(host_id)
 }

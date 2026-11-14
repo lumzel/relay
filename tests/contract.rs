@@ -561,3 +561,20 @@ async fn header_without_ciphertext_is_not_forwarded() {
     expect_closed(&mut a).await;
     expect_silent(&mut b).await;
 }
+
+#[tokio::test]
+async fn malformed_host_or_sid_in_link_hello_is_rejected() {
+    let (addr, _state) = spawn().await;
+    for (bad_host, bad_sid) in [
+        ("host/slash", "sid-ok"),
+        ("host-ok", "sid with space"),
+        ("host-ok", "sid\nline"),
+        ("host\\bs", "sid-ok"),
+    ] {
+        let mut ws = ws_connect(addr, "/control").await;
+        ws.send(Message::text(link_hello(bad_host, bad_sid)))
+            .await
+            .unwrap();
+        expect_closed(&mut ws).await;
+    }
+}

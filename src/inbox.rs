@@ -29,12 +29,18 @@ use crate::routes::Plane;
 
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(5);
 const TICKET_TTL: Duration = Duration::from_secs(30);
-const MAX_TICKETS: usize = 4096;
+const MAX_TICKETS: usize = 16_384;
+const MAX_TICKETS_PER_HOST: usize = 128;
+const MAX_PENDING_HTTP_PER_HOST: usize = 64;
+const MAX_HOST_OUTBOX: usize = 256;
+pub(crate) const MAX_HOST_WS_MSG: usize = 2 * 1024 * 1024;
+const MAX_RES_HEADERS: usize = 64;
 
 #[derive(Debug)]
 pub(crate) enum HttpDispatchError {
     NotFound,
     Unavailable,
+    Busy,
 }
 
 #[derive(Debug, Clone)]
@@ -48,8 +54,9 @@ pub(crate) struct ProxiedHttpRes {
 struct HostEntry {
     seq: u64,
     bot: bool,
-    tx: mpsc::UnboundedSender<String>,
+    tx: mpsc::Sender<String>,
     evict: Arc<Notify>,
+    pending_http: HashMap<u64, tokio::sync::oneshot::Sender<ProxiedHttpRes>>,
 }
 
 struct TicketEntry {
@@ -65,7 +72,7 @@ pub(crate) struct InboxRegistry {
     next_http_id: u64,
     hosts: HashMap<String, HostEntry>,
     tickets: HashMap<String, TicketEntry>,
-    pending_http: HashMap<u64, tokio::sync::oneshot::Sender<ProxiedHttpRes>>,
+    http_host: HashMap<u64, String>,
 }
 
 impl InboxRegistry {
@@ -81,7 +88,7 @@ impl InboxRegistry {
         &mut self,
         host: String,
         bot: bool,
-        tx: mpsc::UnboundedSender<String>,
+        tx: mpsc::Sender<String>,
         evict: Arc<Notify>,
     ) -> u64 {
         self.next_seq = self.next_seq.saturating_add(1);
@@ -93,8 +100,12 @@ impl InboxRegistry {
                 bot,
                 tx,
                 evict,
+                pending_http: HashMap::new(),
             },
         ) {
+            for id in previous.pending_http.keys() {
+                self.http_host.remove(id);
+            }
             previous.evict.notify_one();
         }
         seq
@@ -109,14 +120,18 @@ impl InboxRegistry {
         headers: HashMap<String, String>,
         body: String,
     ) -> Result<(u64, tokio::sync::oneshot::Receiver<ProxiedHttpRes>), HttpDispatchError> {
-        let entry = self.hosts.get(host).ok_or(HttpDispatchError::NotFound)?;
+        let entry = self
+            .hosts
+            .get_mut(host)
+            .ok_or(HttpDispatchError::NotFound)?;
         if !entry.bot {
             return Err(HttpDispatchError::NotFound);
         }
+        if entry.pending_http.len() >= MAX_PENDING_HTTP_PER_HOST {
+            return Err(HttpDispatchError::Busy);
+        }
         self.next_http_id = self.next_http_id.saturating_add(1);
         let id = self.next_http_id;
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending_http.insert(id, tx);
 
         let payload = json!({
             "t": "http",
@@ -129,28 +144,47 @@ impl InboxRegistry {
         })
         .to_string();
 
-        if entry.tx.send(payload).is_err() {
-            self.pending_http.remove(&id);
-            return Err(HttpDispatchError::Unavailable);
+        match entry.tx.try_send(payload) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => return Err(HttpDispatchError::Busy),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Err(HttpDispatchError::Unavailable)
+            }
         }
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        entry.pending_http.insert(id, tx);
+        self.http_host.insert(id, host.to_owned());
 
         Ok((id, rx))
     }
 
-    pub(crate) fn resolve_http_res(&mut self, res: ProxiedHttpRes) {
-        if let Some(tx) = self.pending_http.remove(&res.id) {
+    pub(crate) fn resolve_http_res(&mut self, host: &str, res: ProxiedHttpRes) {
+        let Some(entry) = self.hosts.get_mut(host) else {
+            return;
+        };
+        if let Some(tx) = entry.pending_http.remove(&res.id) {
+            self.http_host.remove(&res.id);
             let _ = tx.send(res);
         }
     }
 
     pub(crate) fn cancel_http_req(&mut self, id: u64) {
-        self.pending_http.remove(&id);
+        if let Some(host) = self.http_host.remove(&id) {
+            if let Some(entry) = self.hosts.get_mut(&host) {
+                entry.pending_http.remove(&id);
+            }
+        }
     }
 
     pub(crate) fn unregister(&mut self, host: &str, seq: u64) {
         if self.hosts.get(host).is_some_and(|entry| entry.seq == seq) {
-            self.hosts.remove(host);
-            self.pending_http.clear();
+            if let Some(removed) = self.hosts.remove(host) {
+                for id in removed.pending_http.keys() {
+                    self.http_host.remove(id);
+                }
+            }
+            self.tickets.retain(|_, entry| entry.host != host);
         }
     }
 
@@ -159,6 +193,22 @@ impl InboxRegistry {
         self.prune_expired(now);
         if !self.hosts.contains_key(host) {
             return false;
+        }
+        let host_tickets = self
+            .tickets
+            .values()
+            .filter(|entry| entry.host == host)
+            .count();
+        if host_tickets >= MAX_TICKETS_PER_HOST {
+            if let Some(oldest) = self
+                .tickets
+                .iter()
+                .filter(|(_, entry)| entry.host == host)
+                .min_by_key(|(_, entry)| entry.expires_at)
+                .map(|(k, _)| k.clone())
+            {
+                self.tickets.remove(&oldest);
+            }
         }
         if self.tickets.len() >= MAX_TICKETS {
             if let Some(oldest) = self
@@ -183,7 +233,7 @@ impl InboxRegistry {
         let sent = self
             .hosts
             .get(host)
-            .is_some_and(|entry| entry.tx.send(payload).is_ok());
+            .is_some_and(|entry| entry.tx.try_send(payload).is_ok());
         if sent {
             self.tickets.insert(
                 ticket,
@@ -237,11 +287,13 @@ pub async fn ws(
     };
     let failed = state.clone();
     let failed_ip = ip_permit.clone();
-    ws.on_failed_upgrade(move |_| {
-        failed_ip.release();
-        failed.lock().unreserve();
-    })
-    .on_upgrade(move |socket| run_inbox(socket, state, ip_permit))
+    ws.max_message_size(MAX_HOST_WS_MSG)
+        .max_frame_size(MAX_HOST_WS_MSG)
+        .on_failed_upgrade(move |_| {
+            failed_ip.release();
+            failed.lock().unreserve();
+        })
+        .on_upgrade(move |socket| run_inbox(socket, state, ip_permit))
 }
 
 struct InboxGuard {
@@ -304,7 +356,7 @@ async fn run_inbox(mut socket: WebSocket, state: AppState, ip_permit: SharedIpPe
         return;
     };
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let (tx, mut rx) = mpsc::channel::<String>(MAX_HOST_OUTBOX);
     let evict = Arc::new(Notify::new());
     let seq = state
         .inbox_lock()
@@ -316,22 +368,45 @@ async fn run_inbox(mut socket: WebSocket, state: AppState, ip_permit: SharedIpPe
         "host": registered_host,
     })
     .to_string();
-    if socket.send(Message::Text(ack.into())).await.is_err() {
+    if !matches!(
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            socket.send(Message::Text(ack.into()))
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
         return;
     }
+
+    let idle_dur = state.limits().idle_timeout();
+    let idle_sleep = tokio::time::sleep(idle_dur);
+    tokio::pin!(idle_sleep);
 
     loop {
         tokio::select! {
             biased;
             _ = evict.notified() => {
-                let _ = socket.send(Message::Close(None)).await;
-                let _ = socket.close().await;
+                let _ = tokio::time::timeout(Duration::from_secs(2), socket.send(Message::Close(None))).await;
+                let _ = tokio::time::timeout(Duration::from_secs(2), socket.close()).await;
+                break;
+            }
+            _ = &mut idle_sleep => {
+                let _ = tokio::time::timeout(Duration::from_secs(2), socket.send(Message::Close(None))).await;
+                let _ = tokio::time::timeout(Duration::from_secs(2), socket.close()).await;
                 break;
             }
             outbound = rx.recv() => {
                 match outbound {
                     Some(text) => {
-                        if socket.send(Message::Text(text.into())).await.is_err() {
+                        if !matches!(
+                            tokio::time::timeout(
+                                Duration::from_secs(30),
+                                socket.send(Message::Text(text.into())),
+                            )
+                            .await,
+                            Ok(Ok(()))
+                        ) {
                             break;
                         }
                     }
@@ -339,35 +414,58 @@ async fn run_inbox(mut socket: WebSocket, state: AppState, ip_permit: SharedIpPe
                 }
             }
             incoming = socket.next() => {
+                idle_sleep.as_mut().reset(Instant::now() + idle_dur);
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(val) = serde_json::from_str::<Value>(&text) {
                             if val.get("t").and_then(Value::as_str) == Some("http_res") {
-                                if let (Some(id), Some(status)) = (
+                                if let (Some(id), Some(status_u64)) = (
                                     val.get("id").and_then(Value::as_u64),
                                     val.get("status").and_then(Value::as_u64),
                                 ) {
+                                    let Ok(status) = u16::try_from(status_u64) else {
+                                        continue;
+                                    };
+                                    if !(100..=599).contains(&status) {
+                                        continue;
+                                    }
                                     let mut headers = HashMap::new();
                                     if let Some(obj) = val.get("headers").and_then(Value::as_object) {
-                                        for (k, v) in obj {
+                                        for (k, v) in obj.iter().take(MAX_RES_HEADERS) {
                                             if let Some(s) = v.as_str() {
                                                 headers.insert(k.to_ascii_lowercase(), s.to_owned());
                                             }
                                         }
                                     }
-                                    let body = val.get("body").and_then(Value::as_str).unwrap_or("").to_owned();
-                                    state.inbox_lock().resolve_http_res(ProxiedHttpRes {
-                                        id,
-                                        status: status as u16,
-                                        headers,
-                                        body,
-                                    });
+                                    let body = val
+                                        .get("body")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("");
+                                    if body.len() > MAX_HOST_WS_MSG {
+                                        continue;
+                                    }
+                                    state.inbox_lock().resolve_http_res(
+                                        &registered_host,
+                                        ProxiedHttpRes {
+                                            id,
+                                            status,
+                                            headers,
+                                            body: body.to_owned(),
+                                        },
+                                    );
                                 }
                             }
                         }
                     }
                     Some(Ok(Message::Ping(payload))) => {
-                        if socket.send(Message::Pong(payload)).await.is_err() {
+                        if !matches!(
+                            tokio::time::timeout(
+                                Duration::from_secs(10),
+                                socket.send(Message::Pong(payload)),
+                            )
+                            .await,
+                            Ok(Ok(()))
+                        ) {
                             break;
                         }
                     }

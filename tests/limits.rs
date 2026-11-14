@@ -198,16 +198,29 @@ async fn trusted_proxy_honors_xff_while_untrusted_peer_ignores_spoofed_xff() {
         429
     );
 
-    // 2. With 127.0.0.1 in trusted_proxies, leftmost X-Forwarded-For IP is used.
+    // 2. With trusted proxies [127.0.0.1, 10.0.0.1], right-to-left XFF walks past trusted proxies
+    // and picks the first untrusted hop; a client-spoofed leftmost IP cannot bypass the limit.
     let (trusted_addr, _) = spawn_with(LimitsConfig {
         max_conns_per_ip: 1,
-        trusted_proxies: vec!["127.0.0.1".parse::<IpAddr>().unwrap()],
+        trusted_proxies: vec![
+            "127.0.0.1".parse::<IpAddr>().unwrap(),
+            "10.0.0.1".parse::<IpAddr>().unwrap(),
+        ],
         ..LimitsConfig::default()
     })
     .await;
     let _t1 = ws_connect_xff(trusted_addr, "/control", Some("198.51.100.10, 10.0.0.1")).await;
     assert_eq!(
         upgrade_status_xff(trusted_addr, "/control", Some("198.51.100.10")).await,
+        429
+    );
+    assert_eq!(
+        upgrade_status_xff(
+            trusted_addr,
+            "/control",
+            Some("198.51.100.99, 198.51.100.10, 10.0.0.1"),
+        )
+        .await,
         429
     );
     let _t2 = ws_connect_xff(trusted_addr, "/control", Some("198.51.100.11")).await;
@@ -382,4 +395,74 @@ async fn handshake_timeout_closes_peer_when_host_sends_no_frame_and_frees_slot()
 
     tokio::time::sleep(Duration::from_millis(260)).await;
     assert_eq!(state.connection_count(&hid, "sid-hs", Plane::Control), 2);
+}
+
+#[tokio::test]
+async fn pre_hello_timeout_closes_silent_socket_even_with_pings_and_frees_ip_slot() {
+    let (addr, _state) = spawn_with(LimitsConfig {
+        max_conns_per_ip: 1,
+        pre_hello_timeout: Duration::from_millis(150),
+        ..LimitsConfig::default()
+    })
+    .await;
+
+    let mut silent = ws_connect(addr, "/control").await;
+    // Send pings before sending link_hello; ping must NOT extend pre_hello_timeout.
+    for _ in 0..3 {
+        let _ = silent.send(Message::Ping(vec![1, 2].into())).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    expect_closed(&mut silent).await;
+    drop(silent);
+
+    // IP slot must be released promptly after pre_hello_timeout closes the socket.
+    for _ in 0..50 {
+        let attempt = tokio_tungstenite::client_async(
+            format!("ws://{addr}/control")
+                .into_client_request()
+                .unwrap(),
+            TcpStream::connect(addr).await.unwrap(),
+        )
+        .await;
+        if attempt.is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("IP slot was not released after pre_hello_timeout");
+}
+
+#[tokio::test]
+async fn route_and_meta_owners_are_cleaned_up_after_release_even_with_punch() {
+    let (addr, state) = spawn_with(LimitsConfig::default()).await;
+    let host = Identity::generate();
+    let (mut inbox, hid) = register_host(addr, &host).await;
+    let (mut peer, mut host_ws) =
+        pair_plane(addr, &mut inbox, &hid, "sid-clean", Plane::Control).await;
+
+    host_ws
+        .send(Message::text(
+            json!({ "t": "punch", "addr": "198.51.100.1:41000" }).to_string(),
+        ))
+        .await
+        .unwrap();
+    let _ = peer.next().await.unwrap().unwrap();
+    assert_eq!(state.route_count(), 1);
+    assert_eq!(state.owner_count(), 1);
+
+    drop(peer);
+    drop(host_ws);
+
+    for _ in 0..50 {
+        if state.route_count() == 0 && state.owner_count() == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!(
+        "route/owner leak after disconnect: routes={}, owners={}",
+        state.route_count(),
+        state.owner_count()
+    );
 }

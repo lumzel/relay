@@ -16,7 +16,7 @@ use tokio::net::TcpListener;
 use crate::control;
 use crate::data;
 use crate::inbox::{self, InboxRegistry};
-use crate::limits::{Limits, LimitsConfig};
+use crate::limits::{Limits, LimitsConfig, PeerAddr};
 use crate::push::{self, PushError, Sender};
 use crate::routes::{Plane, RouteTable};
 
@@ -26,6 +26,7 @@ pub struct AppState {
     inbox: std::sync::Arc<std::sync::Mutex<InboxRegistry>>,
     limits: std::sync::Arc<Limits>,
     ops_token: Option<std::sync::Arc<str>>,
+    push_token: Option<std::sync::Arc<str>>,
     push: Sender,
 }
 
@@ -36,6 +37,7 @@ impl AppState {
             inbox: std::sync::Arc::new(std::sync::Mutex::new(InboxRegistry::default())),
             limits: Limits::new(LimitsConfig::default()),
             ops_token: None,
+            push_token: None,
             push: Sender::unavailable(),
         }
     }
@@ -53,7 +55,13 @@ impl AppState {
                 state.ops_token = Some(std::sync::Arc::from(token));
             }
         }
-        state.push = Sender::from_env();
+        state.push_token = match std::env::var("RELAY_PUSH_TOKEN") {
+            Ok(token) if !token.is_empty() => Some(std::sync::Arc::from(token)),
+            _ => state.ops_token.clone(),
+        };
+        if state.push_token.is_some() {
+            state.push = Sender::from_env();
+        }
         state
     }
 
@@ -72,6 +80,16 @@ impl AppState {
         self
     }
 
+    pub fn with_push_token(mut self, token: impl Into<String>) -> Self {
+        let token = token.into();
+        self.push_token = if token.is_empty() {
+            None
+        } else {
+            Some(std::sync::Arc::from(token))
+        };
+        self
+    }
+
     pub fn with_push_sender(mut self, sender: Sender) -> Self {
         self.push = sender;
         self
@@ -82,11 +100,15 @@ impl AppState {
     }
 
     pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, RouteTable> {
-        self.table.lock().expect("route table")
+        self.table
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub(crate) fn inbox_lock(&self) -> std::sync::MutexGuard<'_, InboxRegistry> {
-        self.inbox.lock().expect("inbox registry")
+        self.inbox
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub(crate) fn limits(&self) -> &std::sync::Arc<Limits> {
@@ -95,6 +117,14 @@ impl AppState {
 
     pub fn connection_count(&self, host: &str, sid: &str, plane: Plane) -> usize {
         self.lock().connection_count(host, sid, plane)
+    }
+
+    pub fn route_count(&self) -> usize {
+        self.lock().route_count()
+    }
+
+    pub fn owner_count(&self) -> usize {
+        self.lock().owner_count()
     }
 
     pub fn punch_addr(&self, host: &str, sid: &str) -> Option<String> {
@@ -160,30 +190,47 @@ async fn ready(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+fn bearer_matches(headers: &HeaderMap, expected: &str) -> bool {
+    let Some(raw) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    let Some(provided) = raw.strip_prefix("Bearer ") else {
+        return false;
+    };
+    let got_digest = Sha256::digest(provided.as_bytes());
+    let want_digest = Sha256::digest(expected.as_bytes());
+    bool::from(got_digest.as_slice().ct_eq(want_digest.as_slice()))
+}
+
 // lumzel:remote-link#r-drain lumzel:remote-link-03#m-drain lumzel:remote-link-03#a-drain
 async fn drain(State(state): State<AppState>, headers: HeaderMap) -> StatusCode {
     let Some(expected) = state.ops_token.as_deref() else {
         return StatusCode::NOT_FOUND;
     };
-    let Some(raw) = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-    else {
-        return StatusCode::UNAUTHORIZED;
-    };
-    let Some(provided) = raw.strip_prefix("Bearer ") else {
-        return StatusCode::UNAUTHORIZED;
-    };
-    let got_digest = Sha256::digest(provided.as_bytes());
-    let want_digest = Sha256::digest(expected.as_bytes());
-    if !bool::from(got_digest.as_slice().ct_eq(want_digest.as_slice())) {
+    if !bearer_matches(&headers, expected) {
         return StatusCode::UNAUTHORIZED;
     }
     state.lock().drain();
     StatusCode::NO_CONTENT
 }
 
-async fn push_wake(State(state): State<AppState>, body: axum::body::Bytes) -> StatusCode {
+async fn push_wake(
+    State(state): State<AppState>,
+    peer: PeerAddr,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> StatusCode {
+    if let Some(expected) = state.push_token.as_deref() {
+        if !bearer_matches(&headers, expected) {
+            return StatusCode::UNAUTHORIZED;
+        }
+    }
+    if state.limits().try_acquire_http(peer.0, &headers).is_none() {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
     match push::accept(&state.push, &body) {
         Ok(()) => StatusCode::NO_CONTENT,
         Err(PushError::Unavailable) => StatusCode::NOT_FOUND,

@@ -16,6 +16,7 @@ use tokio::sync::watch;
 const MAGIC: u32 = 0x2112_A442;
 const BINDING_REQUEST: u16 = 0x0001;
 const HEADER_LEN: usize = 20;
+const MAX_TRACKED_IPS: usize = 65_536;
 pub const DEFAULT_RATE_LIMIT: u32 = 50;
 
 #[derive(Clone)]
@@ -38,6 +39,12 @@ impl RateLimiter {
             Err(p) => p.into_inner(),
         };
         let now = Instant::now();
+        if map.len() > 4096 {
+            map.retain(|_, (ts, _)| now.duration_since(*ts) < Duration::from_secs(2));
+        }
+        if !map.contains_key(&ip) && map.len() >= MAX_TRACKED_IPS {
+            return false;
+        }
         let entry = map.entry(ip).or_insert((now, 0));
         if now.duration_since(entry.0) >= Duration::from_secs(1) {
             entry.0 = now;
@@ -83,8 +90,9 @@ pub async fn serve_socket(
                     continue;
                 }
                 let msg_type = u16::from_be_bytes([buf[0], buf[1]]);
+                let msg_len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
                 let cookie = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
-                if msg_type != BINDING_REQUEST || cookie != MAGIC {
+                if msg_type != BINDING_REQUEST || cookie != MAGIC || len < HEADER_LEN + msg_len {
                     continue;
                 }
                 if !limiter.check_and_inc(peer.ip()) {

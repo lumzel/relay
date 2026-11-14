@@ -19,6 +19,11 @@ pub const DEFAULT_MAX_CONNS_PER_IP: usize = 32;
 pub const DEFAULT_ROUTE_BYTES_PER_SEC: u64 = 2 * 1024 * 1024;
 pub const DEFAULT_ROUTE_BYTES_TOTAL: u64 = 512 * 1024 * 1024;
 pub const DEFAULT_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
+pub const DEFAULT_PRE_HELLO_TIMEOUT_MS: u64 = 5_000;
+pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 90_000;
+pub const DEFAULT_HTTP_REQ_PER_SEC: u32 = 30;
+pub const DEFAULT_HTTP_MAX_CONNS_PER_IP: usize = 64;
+const MAX_HTTP_TRACKED_IPS: usize = 65_536;
 
 #[derive(Debug, Clone)]
 pub struct LimitsConfig {
@@ -26,6 +31,10 @@ pub struct LimitsConfig {
     pub route_bytes_per_sec: u64,
     pub route_bytes_total: u64,
     pub handshake_timeout: Duration,
+    pub pre_hello_timeout: Duration,
+    pub idle_timeout: Duration,
+    pub http_req_per_sec: u32,
+    pub http_max_conns_per_ip: usize,
     pub trusted_proxies: Vec<IpAddr>,
 }
 
@@ -36,6 +45,10 @@ impl Default for LimitsConfig {
             route_bytes_per_sec: DEFAULT_ROUTE_BYTES_PER_SEC,
             route_bytes_total: DEFAULT_ROUTE_BYTES_TOTAL,
             handshake_timeout: Duration::from_millis(DEFAULT_HANDSHAKE_TIMEOUT_MS),
+            pre_hello_timeout: Duration::from_millis(DEFAULT_PRE_HELLO_TIMEOUT_MS),
+            idle_timeout: Duration::from_millis(DEFAULT_IDLE_TIMEOUT_MS),
+            http_req_per_sec: DEFAULT_HTTP_REQ_PER_SEC,
+            http_max_conns_per_ip: DEFAULT_HTTP_MAX_CONNS_PER_IP,
             trusted_proxies: Vec::new(),
         }
     }
@@ -62,6 +75,26 @@ impl LimitsConfig {
         if let Ok(v) = std::env::var("RELAY_HANDSHAKE_TIMEOUT_MS") {
             if let Ok(parsed) = v.parse::<u64>() {
                 cfg.handshake_timeout = Duration::from_millis(parsed);
+            }
+        }
+        if let Ok(v) = std::env::var("RELAY_PRE_HELLO_TIMEOUT_MS") {
+            if let Ok(parsed) = v.parse::<u64>() {
+                cfg.pre_hello_timeout = Duration::from_millis(parsed);
+            }
+        }
+        if let Ok(v) = std::env::var("RELAY_IDLE_TIMEOUT_MS") {
+            if let Ok(parsed) = v.parse::<u64>() {
+                cfg.idle_timeout = Duration::from_millis(parsed);
+            }
+        }
+        if let Ok(v) = std::env::var("RELAY_HTTP_REQ_PER_SEC") {
+            if let Ok(parsed) = v.parse::<u32>() {
+                cfg.http_req_per_sec = parsed;
+            }
+        }
+        if let Ok(v) = std::env::var("RELAY_HTTP_MAX_CONNS_PER_IP") {
+            if let Ok(parsed) = v.parse::<usize>() {
+                cfg.http_max_conns_per_ip = parsed;
             }
         }
         if let Ok(v) = std::env::var("RELAY_TRUSTED_PROXY") {
@@ -104,9 +137,16 @@ struct RouteQuota {
     active_conns: usize,
 }
 
+struct HttpIpBucket {
+    tokens: f64,
+    last_refill: Instant,
+    active: usize,
+}
+
 #[derive(Default)]
 struct LimitsInner {
     ip_conns: HashMap<IpAddr, usize>,
+    http_ips: HashMap<IpAddr, HttpIpBucket>,
     routes: HashMap<(String, String), RouteQuota>,
 }
 
@@ -127,22 +167,42 @@ impl Limits {
         self.config.handshake_timeout
     }
 
+    pub(crate) fn pre_hello_timeout(&self) -> Duration {
+        self.config.pre_hello_timeout
+    }
+
+    pub(crate) fn idle_timeout(&self) -> Duration {
+        self.config.idle_timeout
+    }
+
     pub(crate) fn resolve_client_ip(&self, peer: Option<IpAddr>, headers: &HeaderMap) -> IpAddr {
         let tcp_ip = peer
             .map(canonical_ip)
             .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-        let trusted = self
-            .config
-            .trusted_proxies
-            .iter()
-            .any(|proxy| canonical_ip(*proxy) == tcp_ip);
-        if trusted {
-            if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-                if let Some(first) = xff.split(',').next() {
-                    if let Ok(parsed) = first.trim().parse::<IpAddr>() {
-                        return canonical_ip(parsed);
-                    }
+        let is_trusted = |ip: IpAddr| {
+            let ip = canonical_ip(ip);
+            self.config
+                .trusted_proxies
+                .iter()
+                .any(|proxy| canonical_ip(*proxy) == ip)
+        };
+        if !is_trusted(tcp_ip) {
+            return tcp_ip;
+        }
+        if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+            let mut last_valid = None;
+            for part in xff.rsplit(',') {
+                let Ok(parsed) = part.trim().parse::<IpAddr>() else {
+                    break;
+                };
+                let ip = canonical_ip(parsed);
+                last_valid = Some(ip);
+                if !is_trusted(ip) {
+                    return ip;
                 }
+            }
+            if let Some(ip) = last_valid {
+                return ip;
             }
         }
         tcp_ip
@@ -157,7 +217,10 @@ impl Limits {
             return None;
         }
         let ip = self.resolve_client_ip(peer, headers);
-        let mut inner = self.inner.lock().expect("limits");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let count = inner.ip_conns.entry(ip).or_insert(0);
         if *count >= self.config.max_conns_per_ip {
             if *count == 0 {
@@ -172,11 +235,67 @@ impl Limits {
         }))
     }
 
+    pub(crate) fn try_acquire_http(
+        self: &Arc<Self>,
+        peer: Option<IpAddr>,
+        headers: &HeaderMap,
+    ) -> Option<HttpPermit> {
+        if self.config.http_max_conns_per_ip == 0 {
+            return None;
+        }
+        let ip = self.resolve_client_ip(peer, headers);
+        let now = Instant::now();
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if inner.http_ips.len() > 4096 {
+            inner.http_ips.retain(|_, b| {
+                b.active > 0 || now.duration_since(b.last_refill) < Duration::from_secs(60)
+            });
+        }
+        if !inner.http_ips.contains_key(&ip) && inner.http_ips.len() >= MAX_HTTP_TRACKED_IPS {
+            return None;
+        }
+
+        let rate = self.config.http_req_per_sec as f64;
+        let burst = (rate * 2.0).max(10.0);
+        let bucket = inner.http_ips.entry(ip).or_insert_with(|| HttpIpBucket {
+            tokens: burst,
+            last_refill: now,
+            active: 0,
+        });
+
+        if bucket.active >= self.config.http_max_conns_per_ip {
+            return None;
+        }
+
+        if self.config.http_req_per_sec > 0 {
+            let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+            bucket.last_refill = now;
+            bucket.tokens = (bucket.tokens + elapsed * rate).min(burst);
+            if bucket.tokens < 1.0 {
+                return None;
+            }
+            bucket.tokens -= 1.0;
+        }
+
+        bucket.active += 1;
+        Some(HttpPermit {
+            limits: Arc::clone(self),
+            ip,
+        })
+    }
+
     pub(crate) fn attach_route(self: &Arc<Self>, host: &str, sid: &str) -> RouteLimitGuard {
         let key = (host.to_owned(), sid.to_owned());
         let burst = burst_bytes(self.config.route_bytes_per_sec);
         {
-            let mut inner = self.inner.lock().expect("limits");
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let quota = inner
                 .routes
                 .entry(key.clone())
@@ -196,7 +315,10 @@ impl Limits {
 
     pub(crate) fn charge_route(&self, host: &str, sid: &str, len: usize) -> ChargeOutcome {
         let key = (host.to_owned(), sid.to_owned());
-        let mut inner = self.inner.lock().expect("limits");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let burst = burst_bytes(self.config.route_bytes_per_sec);
         let now = Instant::now();
         let quota = inner.routes.entry(key).or_insert_with(|| RouteQuota {
@@ -230,7 +352,10 @@ impl Limits {
     }
 
     fn release_ip(&self, ip: IpAddr) {
-        let mut inner = self.inner.lock().expect("limits");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(count) = inner.ip_conns.get_mut(&ip) {
             *count = count.saturating_sub(1);
             if *count == 0 {
@@ -239,8 +364,21 @@ impl Limits {
         }
     }
 
+    fn release_http_ip(&self, ip: IpAddr) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(bucket) = inner.http_ips.get_mut(&ip) {
+            bucket.active = bucket.active.saturating_sub(1);
+        }
+    }
+
     fn detach_route(&self, key: &(String, String)) {
-        let mut inner = self.inner.lock().expect("limits");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(quota) = inner.routes.get_mut(key) {
             quota.active_conns = quota.active_conns.saturating_sub(1);
             if quota.active_conns == 0 {
@@ -261,6 +399,17 @@ impl Drop for IpPermit {
     }
 }
 
+pub(crate) struct HttpPermit {
+    limits: Arc<Limits>,
+    ip: IpAddr,
+}
+
+impl Drop for HttpPermit {
+    fn drop(&mut self) {
+        self.limits.release_http_ip(self.ip);
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct SharedIpPermit(Arc<Mutex<Option<IpPermit>>>);
 
@@ -270,7 +419,11 @@ impl SharedIpPermit {
     }
 
     pub(crate) fn release(&self) {
-        let _ = self.0.lock().expect("ip permit").take();
+        let _ = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
     }
 }
 

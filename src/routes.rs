@@ -125,6 +125,13 @@ pub struct RouteTable {
     conns: HashMap<ConnId, Conn>,
 }
 
+pub fn valid_route_id(value: &str) -> bool {
+    (1..=256).contains(&value.len())
+        && !value
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || c == '/' || c == '\\')
+}
+
 impl RouteTable {
     pub fn new(node_id: impl Into<String>, max_conns: usize) -> Self {
         Self::with_meta(node_id, max_conns, Arc::new(RouteMeta::new()))
@@ -202,12 +209,16 @@ impl RouteTable {
         if self.draining {
             return Err(RouteError::Draining);
         }
-        if !(1..=256).contains(&host.len()) || !(1..=256).contains(&sid.len()) {
+        if !valid_route_id(host) || !valid_route_id(sid) {
             return Err(RouteError::BadId);
         }
         let key: Key = (host.to_owned(), sid.to_owned());
         {
-            let mut owners = self.meta.owners.lock().expect("route meta");
+            let mut owners = self
+                .meta
+                .owners
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             match owners.get(&key) {
                 Some(owner) if owner != node_id => {
                     return Err(RouteError::OwnedBy {
@@ -293,9 +304,11 @@ impl RouteTable {
                     pending.clear();
                 }
             }
-            empty = route.control.iter().all(Option::is_none)
-                && route.data.iter().all(Option::is_none)
-                && route.punch.is_none();
+            empty =
+                route.control.iter().all(Option::is_none) && route.data.iter().all(Option::is_none);
+            if empty {
+                route.punch = None;
+            }
         }
         if let Some(peer_id) = peer_to_close {
             if let Some(peer_conn) = self.conns.remove(&peer_id) {
@@ -308,6 +321,11 @@ impl RouteTable {
                     && route.data.iter().all(Option::is_none)
                 {
                     self.routes.remove(&conn.key);
+                    self.meta
+                        .owners
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&conn.key);
                 }
             }
         }
@@ -315,14 +333,30 @@ impl RouteTable {
 
     pub fn close_route(&mut self, host: &str, sid: &str) {
         let key = (host.to_owned(), sid.to_owned());
-        let Some(route) = self.routes.remove(&key) else {
-            return;
-        };
-        for id in route.control.into_iter().chain(route.data).flatten() {
-            if let Some(conn) = self.conns.remove(&id) {
-                conn.notify.notify_one();
+        if let Some(route) = self.routes.remove(&key) {
+            for id in route.control.into_iter().chain(route.data).flatten() {
+                if let Some(conn) = self.conns.remove(&id) {
+                    conn.notify.notify_one();
+                }
             }
         }
+        self.meta
+            .owners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&key);
+    }
+
+    pub fn route_count(&self) -> usize {
+        self.routes.len()
+    }
+
+    pub fn owner_count(&self) -> usize {
+        self.meta
+            .owners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
     }
 
     pub(crate) fn start_peer_handshake(&mut self, id: ConnId) -> Option<Arc<HandshakeWatch>> {

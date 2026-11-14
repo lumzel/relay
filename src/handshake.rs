@@ -41,14 +41,14 @@ pub fn check_hello(text: &str) -> Result<Hello, ()> {
     }
     let host = value.get("host").and_then(|v| v.as_str()).ok_or(())?;
     let sid = value.get("sid").and_then(|v| v.as_str()).ok_or(())?;
-    if !valid_id(host) || !valid_id(sid) {
+    if !crate::routes::valid_route_id(host) || !crate::routes::valid_route_id(sid) {
         return Err(());
     }
     let ticket = match value.get("ticket") {
         None | Some(serde_json::Value::Null) => None,
         Some(v) => {
             let s = v.as_str().ok_or(())?;
-            if !valid_id(s) {
+            if !valid_ticket(s) {
                 return Err(());
             }
             Some(s.to_owned())
@@ -61,8 +61,8 @@ pub fn check_hello(text: &str) -> Result<Hello, ()> {
     })
 }
 
-fn valid_id(value: &str) -> bool {
-    (1..=256).contains(&value.len())
+fn valid_ticket(value: &str) -> bool {
+    (1..=256).contains(&value.len()) && !value.chars().any(|c| c.is_control() || c.is_whitespace())
 }
 
 #[cfg(test)]
