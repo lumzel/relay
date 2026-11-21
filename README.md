@@ -103,6 +103,8 @@ server {
 | :--- | :--- | :--- |
 | `RELAY_BIND` | `0.0.0.0:8080` | TCP listen address for HTTP & WebSockets |
 | `RELAY_STUN_BIND` | *(empty)* | Comma-separated UDP addresses for STUN, e.g. `0.0.0.0:3478,0.0.0.0:3479` |
+| `RELAY_STUN_PUBLIC_ADDRS` | *(empty)* | Comma-separated STUN `host:port` list advertised via `/health` (prioritized for non-CN / default requests) |
+| `RELAY_STUN_CN_ADDRS` | *(empty)* | Comma-separated STUN `host:port` list advertised via `/health` (prioritized when `CF-IPCountry: CN`) |
 | `RELAY_NODE_ID` | `local` | Node identifier for multi-relay routing |
 | `RELAY_MAX_CONNS` | `1024` | Maximum total concurrent connections |
 | `RELAY_OPS_TOKEN` | *(empty)* | Bearer token required for `/drain` endpoint (graceful shutdown) |

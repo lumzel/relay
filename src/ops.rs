@@ -35,6 +35,9 @@ pub struct AppState {
     push: Sender,
     openai_apps_challenge: Option<std::sync::Arc<str>>,
     public_url: Option<std::sync::Arc<str>>,
+    stun_public_addrs: std::sync::Arc<Vec<String>>,
+    stun_cn_addrs: std::sync::Arc<Vec<String>>,
+    stun_local_ports: std::sync::Arc<Vec<u16>>,
     dcr_secret: std::sync::Arc<[u8; 32]>,
     short_codes: std::sync::Arc<std::sync::Mutex<crate::shortcode::ShortCodes>>,
 }
@@ -46,8 +49,18 @@ impl std::fmt::Debug for AppState {
             .field("ops_token_set", &self.ops_token.is_some())
             .field("push_token_set", &self.push_token.is_some())
             .field("public_url", &self.public_url)
+            .field("stun_public_addrs", &self.stun_public_addrs)
+            .field("stun_cn_addrs", &self.stun_cn_addrs)
             .finish()
     }
+}
+
+pub fn parse_stun_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 impl AppState {
@@ -64,6 +77,9 @@ impl AppState {
             push: Sender::unavailable(),
             openai_apps_challenge: None,
             public_url: None,
+            stun_public_addrs: std::sync::Arc::new(Vec::new()),
+            stun_cn_addrs: std::sync::Arc::new(Vec::new()),
+            stun_local_ports: std::sync::Arc::new(Vec::new()),
             dcr_secret: std::sync::Arc::new(dcr_secret),
             short_codes: Default::default(),
         }
@@ -109,6 +125,18 @@ impl AppState {
                 state.dcr_secret = std::sync::Arc::new(digest);
             }
         }
+        if let Ok(raw) = std::env::var("RELAY_STUN_PUBLIC_ADDRS") {
+            let addrs = parse_stun_list(&raw);
+            if !addrs.is_empty() {
+                state = state.with_stun_public_addrs(addrs);
+            }
+        }
+        if let Ok(raw) = std::env::var("RELAY_STUN_CN_ADDRS") {
+            let addrs = parse_stun_list(&raw);
+            if !addrs.is_empty() {
+                state = state.with_stun_cn_addrs(addrs);
+            }
+        }
         state
     }
 
@@ -148,6 +176,62 @@ impl AppState {
             Some(std::sync::Arc::from(trimmed))
         };
         self
+    }
+
+    pub fn with_stun_public_addrs(mut self, addrs: Vec<String>) -> Self {
+        self.stun_public_addrs = std::sync::Arc::new(addrs);
+        self
+    }
+
+    pub fn with_stun_cn_addrs(mut self, addrs: Vec<String>) -> Self {
+        self.stun_cn_addrs = std::sync::Arc::new(addrs);
+        self
+    }
+
+    pub fn with_stun_local_ports(mut self, ports: Vec<u16>) -> Self {
+        self.stun_local_ports = std::sync::Arc::new(ports);
+        self
+    }
+
+    /// Order advertised STUN addresses by `CF-IPCountry`: `CN` requests get
+    /// `stun_cn_addrs` first with `stun_public_addrs` as fallback, and other
+    /// requests get `stun_public_addrs` first with `stun_cn_addrs` as fallback.
+    /// Falls back to the request `Host` with `stun_local_ports` when no explicit
+    /// STUN addresses are configured.
+    pub fn stun_addrs_for_headers(&self, headers: &HeaderMap) -> Vec<String> {
+        let is_cn = headers
+            .get("cf-ipcountry")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("CN"));
+        let (primary, fallback) = if is_cn {
+            (&self.stun_cn_addrs, &self.stun_public_addrs)
+        } else {
+            (&self.stun_public_addrs, &self.stun_cn_addrs)
+        };
+        let mut out = Vec::with_capacity(primary.len() + fallback.len());
+        for addr in primary.iter().chain(fallback.iter()) {
+            if !out.contains(addr) {
+                out.push(addr.clone());
+            }
+        }
+        if out.is_empty() && !self.stun_local_ports.is_empty() {
+            if let Some(host) = headers
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|raw| raw.parse::<axum::http::uri::Authority>().ok())
+                .map(|auth| auth.host().to_owned())
+            {
+                let formatted_host = if host.contains(':') {
+                    format!("[{host}]")
+                } else {
+                    host
+                };
+                for &port in self.stun_local_ports.iter() {
+                    out.push(format!("{formatted_host}:{port}"));
+                }
+            }
+        }
+        out
     }
 
     pub(crate) fn openai_apps_challenge(&self) -> Option<&str> {
@@ -290,9 +374,14 @@ pub async fn serve(listener: TcpListener, state: AppState) -> std::io::Result<()
     .await
 }
 
-// Process liveness only.
-async fn health() -> Json<serde_json::Value> {
-    Json(json!({"ok": true}))
+// Process liveness and optional region-aware STUN advertisement.
+async fn health(State(state): State<AppState>, headers: HeaderMap) -> Json<serde_json::Value> {
+    let stun_addrs = state.stun_addrs_for_headers(&headers);
+    if stun_addrs.is_empty() {
+        Json(json!({"ok": true}))
+    } else {
+        Json(json!({"ok": true, "stun_addrs": stun_addrs}))
+    }
 }
 
 async fn ready(State(state): State<AppState>) -> impl IntoResponse {
@@ -350,5 +439,76 @@ async fn push_wake(State(state): State<AppState>, peer: PeerAddr, req: Request) 
         Ok(()) => StatusCode::NO_CONTENT,
         Err(PushError::Unavailable) => StatusCode::NOT_FOUND,
         Err(PushError::BadPayload) => StatusCode::BAD_REQUEST,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn stun_addrs_prioritize_cf_country_with_deduped_fallback() {
+        let state = AppState::new("n", 8)
+            .with_stun_public_addrs(vec![
+                "global1.example.com:3478".into(),
+                "shared.example.com:3478".into(),
+            ])
+            .with_stun_cn_addrs(vec![
+                "cn1.example.com:3478".into(),
+                "shared.example.com:3478".into(),
+            ]);
+
+        let empty_headers = HeaderMap::new();
+        assert_eq!(
+            state.stun_addrs_for_headers(&empty_headers),
+            vec![
+                "global1.example.com:3478",
+                "shared.example.com:3478",
+                "cn1.example.com:3478",
+            ]
+        );
+
+        let mut cn_headers = HeaderMap::new();
+        cn_headers.insert("CF-IPCountry", HeaderValue::from_static("cn"));
+        assert_eq!(
+            state.stun_addrs_for_headers(&cn_headers),
+            vec![
+                "cn1.example.com:3478",
+                "shared.example.com:3478",
+                "global1.example.com:3478",
+            ]
+        );
+
+        let mut us_headers = HeaderMap::new();
+        us_headers.insert("CF-IPCountry", HeaderValue::from_static("US"));
+        assert_eq!(
+            state.stun_addrs_for_headers(&us_headers),
+            vec![
+                "global1.example.com:3478",
+                "shared.example.com:3478",
+                "cn1.example.com:3478",
+            ]
+        );
+    }
+
+    #[test]
+    fn stun_addrs_empty_when_unconfigured() {
+        let state = AppState::new("n", 8);
+        assert!(state.stun_addrs_for_headers(&HeaderMap::new()).is_empty());
+    }
+
+    #[test]
+    fn stun_addrs_fall_back_to_request_host_with_local_ports() {
+        let state = AppState::new("n", 8).with_stun_local_ports(vec![3478, 3479]);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::HOST,
+            HeaderValue::from_static("relay.example.com:8080"),
+        );
+        assert_eq!(
+            state.stun_addrs_for_headers(&headers),
+            vec!["relay.example.com:3478", "relay.example.com:3479"]
+        );
     }
 }

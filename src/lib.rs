@@ -14,7 +14,7 @@ pub mod stun;
 
 pub use auth::CliArgs;
 pub use limits::LimitsConfig;
-pub use ops::{serve, AppState};
+pub use ops::{parse_stun_list, serve, AppState};
 pub use punch::{parse_punch, Punch};
 pub use push::Sender;
 pub use routes::{ConnId, Plane, RouteError, RouteMeta, RouteTable, Side};

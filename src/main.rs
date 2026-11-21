@@ -21,6 +21,12 @@ async fn main() {
     if let Some(password) = cli.password {
         state = state.with_password(password);
     }
+    if let Some(addrs) = cli.stun_public_addrs {
+        state = state.with_stun_public_addrs(lumzel_relay::parse_stun_list(&addrs));
+    }
+    if let Some(addrs) = cli.stun_cn_addrs {
+        state = state.with_stun_cn_addrs(lumzel_relay::parse_stun_list(&addrs));
+    }
 
     let listener = match tokio::net::TcpListener::bind(&bind).await {
         Ok(listener) => listener,
@@ -47,6 +53,8 @@ async fn main() {
             {
                 Ok(srv) => {
                     eprintln!("lumzel-relay STUN listening on {:?}", srv.addrs);
+                    let ports = srv.addrs.iter().map(|a| a.port()).collect();
+                    state = state.with_stun_local_ports(ports);
                     Some(srv)
                 }
                 Err(err) => {

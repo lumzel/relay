@@ -7,7 +7,7 @@ resolver = "2"
 
 [package]
 name = "lumzel-relay"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Zero-retention, end-to-end encrypted relay and bot MCP gateway for Lumzel"

@@ -26,7 +26,7 @@ permissions:
 jobs:
   test:
     name: Run Tests
-    runs-on: ubuntu-latest
+    runs-on: oc-du-1
     steps:
       - uses: actions/checkout@v4
 
@@ -42,7 +42,7 @@ jobs:
   docker:
     name: Build & Push Multi-Arch Docker Image
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: oc-du-1
     steps:
       - uses: actions/checkout@v4
 

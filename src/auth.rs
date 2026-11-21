@@ -25,6 +25,8 @@ const QUERY_AUTH_KEYS: &[&str] = &["token", "password", "relay_token", "relay_pa
 pub struct CliArgs {
     pub bind: Option<String>,
     pub stun_bind: Option<String>,
+    pub stun_public_addrs: Option<String>,
+    pub stun_cn_addrs: Option<String>,
     pub password: Option<String>,
     pub help: bool,
 }
@@ -34,6 +36,8 @@ impl std::fmt::Debug for CliArgs {
         f.debug_struct("CliArgs")
             .field("bind", &self.bind)
             .field("stun_bind", &self.stun_bind)
+            .field("stun_public_addrs", &self.stun_public_addrs)
+            .field("stun_cn_addrs", &self.stun_cn_addrs)
             .field("password", &self.password.as_ref().map(|_| "[redacted]"))
             .field("help", &self.help)
             .finish()
@@ -45,10 +49,12 @@ impl CliArgs {
         "Usage: lumzel-relay [OPTIONS]\n\
          \n\
          Options:\n\
-           --bind <ADDR>         TCP listen address (overrides RELAY_BIND, default 0.0.0.0:8080)\n\
-           --stun-bind <ADDRS>   Comma-separated UDP STUN addresses (overrides RELAY_STUN_BIND)\n\
-           --password <SECRET>   Require shared secret on Relay endpoints (overrides LUMZEL_RELAY_PASSWORD / RELAY_PASSWORD)\n\
-           -h, --help            Print this help message\n"
+           --bind <ADDR>               TCP listen address (overrides RELAY_BIND, default 0.0.0.0:8080)\n\
+           --stun-bind <ADDRS>         Comma-separated UDP STUN addresses (overrides RELAY_STUN_BIND)\n\
+           --stun-public-addrs <ADDRS> Comma-separated advertised STUN host:port list (overrides RELAY_STUN_PUBLIC_ADDRS)\n\
+           --stun-cn-addrs <ADDRS>     Comma-separated STUN host:port list prioritized for CF-IPCountry=CN (overrides RELAY_STUN_CN_ADDRS)\n\
+           --password <SECRET>         Require shared secret on Relay endpoints (overrides LUMZEL_RELAY_PASSWORD / RELAY_PASSWORD)\n\
+           -h, --help                  Print this help message\n"
     }
 
     pub fn parse<I, S>(args: I) -> Result<Self, String>
@@ -76,6 +82,18 @@ impl CliArgs {
                         .ok_or_else(|| "missing value for --stun-bind".to_owned())?;
                     out.stun_bind = Some(val.as_ref().to_owned());
                 }
+                "--stun-public-addrs" => {
+                    let val = iter
+                        .next()
+                        .ok_or_else(|| "missing value for --stun-public-addrs".to_owned())?;
+                    out.stun_public_addrs = Some(val.as_ref().to_owned());
+                }
+                "--stun-cn-addrs" => {
+                    let val = iter
+                        .next()
+                        .ok_or_else(|| "missing value for --stun-cn-addrs".to_owned())?;
+                    out.stun_cn_addrs = Some(val.as_ref().to_owned());
+                }
                 "--password" => {
                     let val = iter
                         .next()
@@ -87,6 +105,12 @@ impl CliArgs {
                 }
                 _ if arg.starts_with("--stun-bind=") => {
                     out.stun_bind = Some(arg["--stun-bind=".len()..].to_owned());
+                }
+                _ if arg.starts_with("--stun-public-addrs=") => {
+                    out.stun_public_addrs = Some(arg["--stun-public-addrs=".len()..].to_owned());
+                }
+                _ if arg.starts_with("--stun-cn-addrs=") => {
+                    out.stun_cn_addrs = Some(arg["--stun-cn-addrs=".len()..].to_owned());
                 }
                 _ if arg.starts_with("--password=") => {
                     out.password = Some(arg["--password=".len()..].to_owned());
@@ -325,5 +349,23 @@ mod tests {
 
         assert!(CliArgs::parse(["--unknown"]).is_err());
         assert!(CliArgs::parse(["--password"]).is_err());
+    }
+
+    #[test]
+    fn cli_args_parse_stun_advertised_flags() {
+        let parsed = CliArgs::parse([
+            "--stun-public-addrs",
+            "stun.example.com:3478,1.2.3.4:3479",
+            "--stun-cn-addrs=cn1.example.com:3478,cn2.example.com:3478",
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed.stun_public_addrs.as_deref(),
+            Some("stun.example.com:3478,1.2.3.4:3479")
+        );
+        assert_eq!(
+            parsed.stun_cn_addrs.as_deref(),
+            Some("cn1.example.com:3478,cn2.example.com:3478")
+        );
     }
 }
