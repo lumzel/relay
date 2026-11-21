@@ -609,8 +609,9 @@ mod tests {
             assert_eq!(opened.host, "h");
             assert_eq!(opened.sid, "gap");
         }
+        let max_secs = if cfg!(debug_assertions) { 10 } else { 2 };
         assert!(
-            started.elapsed().as_secs() < 2,
+            started.elapsed().as_secs() < max_secs,
             "20k replay took {:?}",
             started.elapsed()
         );

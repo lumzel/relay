@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod bot;
 mod control;
 mod data;
@@ -8,8 +9,10 @@ mod ops;
 mod punch;
 mod push;
 mod routes;
+pub mod shortcode;
 pub mod stun;
 
+pub use auth::CliArgs;
 pub use limits::LimitsConfig;
 pub use ops::{serve, AppState};
 pub use punch::{parse_punch, Punch};

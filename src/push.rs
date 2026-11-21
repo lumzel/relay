@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 const MAX_LOG_ENTRIES: usize = 1024;
-const MAX_WAKE_PAYLOAD: usize = 4096;
+pub(crate) const MAX_WAKE_PAYLOAD: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Wake {

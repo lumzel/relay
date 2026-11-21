@@ -106,6 +106,7 @@ server {
 | `RELAY_NODE_ID` | `local` | Node identifier for multi-relay routing |
 | `RELAY_MAX_CONNS` | `1024` | Maximum total concurrent connections |
 | `RELAY_OPS_TOKEN` | *(empty)* | Bearer token required for `/drain` endpoint (graceful shutdown) |
+| `LUMZEL_RELAY_PASSWORD` | *(empty)* | Optional access password (`--password`, alias `RELAY_PASSWORD`) for private deployments; rejects unauthenticated requests with `401` |
 | `RELAY_TRUST_FORWARDED_FOR` | `0` | Set to `1` when behind a trusted reverse proxy (Nginx/Caddy) to parse `X-Forwarded-For` |
 
 ---

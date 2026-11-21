@@ -34,6 +34,13 @@ impl RateLimiter {
     }
 
     pub fn check_and_inc(&self, ip: IpAddr) -> bool {
+        let ip = match ip {
+            IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map(IpAddr::V4)
+                .unwrap_or(IpAddr::V6(v6)),
+            v4 => v4,
+        };
         let mut map = match self.records.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),

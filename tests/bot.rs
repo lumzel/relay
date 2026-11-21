@@ -575,3 +575,625 @@ async fn http_rate_limit_and_drain_block_bot_endpoints() {
     let (status, _, _) = send_http(addr, "POST", &format!("/mcp/{hid}"), &[], b"{}").await;
     assert_eq!(status, 503);
 }
+
+#[tokio::test]
+async fn well_known_endpoints_proxy_to_host() {
+    let (addr, _) = spawn().await;
+    let host_identity = Identity::generate();
+    let (mut inbox, hid) = register_host(addr, &host_identity, true).await;
+
+    for suffix in ["oauth-protected-resource", "oauth-authorization-server"] {
+        let path = format!("/.well-known/{suffix}/mcp/{hid}");
+        let target_path = path.clone();
+        let client_task =
+            tokio::spawn(async move { send_http(addr, "GET", &target_path, &[], b"").await });
+
+        let msg = read_json(&mut inbox).await;
+        assert_eq!(msg["t"], "http");
+        assert_eq!(msg["method"], "GET");
+        assert_eq!(msg["path"], path);
+
+        let reply = json!({
+            "t": "http_res",
+            "id": msg["id"],
+            "status": 200,
+            "headers": { "Content-Type": "application/json" },
+            "body": B64.encode(format!(r#"{{"endpoint":"{suffix}"}}"#).as_bytes()),
+        });
+        inbox.send(Message::text(reply.to_string())).await.unwrap();
+
+        let (status, headers, body) = client_task.await.unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(headers.get("content-type").unwrap(), "application/json");
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            format!(r#"{{"endpoint":"{suffix}"}}"#)
+        );
+    }
+}
+
+#[tokio::test]
+async fn authorize_non_200_passthrough_and_missing_request_returns_502() {
+    let (addr, _) = spawn().await;
+    let host_identity = Identity::generate();
+    let (mut inbox, hid) = register_host(addr, &host_identity, true).await;
+
+    // 1. /authorize returning 400 JSON passes through instead of rendering HTML template
+    let target_hid = hid.clone();
+    let t1 = tokio::spawn(async move {
+        send_http(
+            addr,
+            "GET",
+            &format!("/mcp/{target_hid}/authorize?client_id=unknown"),
+            &[],
+            b"",
+        )
+        .await
+    });
+    let msg = read_json(&mut inbox).await;
+    inbox
+        .send(Message::text(
+            json!({
+                "t": "http_res",
+                "id": msg["id"],
+                "status": 400,
+                "headers": { "Content-Type": "application/json" },
+                "body": B64.encode(br#"{"error":"invalid_client"}"#),
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let (status, headers, body) = t1.await.unwrap();
+    assert_eq!(status, 400);
+    assert_eq!(headers.get("content-type").unwrap(), "application/json");
+    assert_eq!(
+        String::from_utf8(body).unwrap(),
+        r#"{"error":"invalid_client"}"#
+    );
+
+    // 2. /authorize returning 200 JSON without non-empty "request" returns 502
+    let target_hid = hid.clone();
+    let t2 = tokio::spawn(async move {
+        send_http(
+            addr,
+            "GET",
+            &format!("/mcp/{target_hid}/authorize"),
+            &[],
+            b"",
+        )
+        .await
+    });
+    let msg = read_json(&mut inbox).await;
+    inbox
+        .send(Message::text(
+            json!({
+                "t": "http_res",
+                "id": msg["id"],
+                "status": 200,
+                "headers": { "Content-Type": "application/json" },
+                "body": B64.encode(br#"{"request":"","host_name":"Mac","user_code":"123456"}"#),
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let (status, _, _) = t2.await.unwrap();
+    assert_eq!(status, 502);
+}
+
+#[tokio::test]
+async fn oversized_host_ws_response_terminates_and_safe_content_types_preserved() {
+    let (addr, _) = spawn().await;
+    let host_identity = Identity::generate();
+    let (mut inbox, hid) = register_host(addr, &host_identity, true).await;
+
+    // 0. Non-GET on /.well-known returns 404 without hitting Host
+    let (status, _, _) = send_http(
+        addr,
+        "POST",
+        &format!("/.well-known/oauth-protected-resource/mcp/{hid}"),
+        &[],
+        b"{}",
+    )
+    .await;
+    assert_eq!(status, 404);
+
+    // 1. Safe content-types such as application/problem+json, text/plain, and application/octet-stream are preserved
+    for ct in [
+        "application/problem+json; charset=utf-8",
+        "text/plain",
+        "application/octet-stream",
+    ] {
+        let target_hid = hid.clone();
+        let t = tokio::spawn(async move {
+            send_http(addr, "POST", &format!("/mcp/{target_hid}"), &[], b"{}").await
+        });
+        let msg = read_json(&mut inbox).await;
+        inbox
+            .send(Message::text(
+                json!({
+                    "t": "http_res",
+                    "id": msg["id"],
+                    "status": 200,
+                    "headers": { "Content-Type": ct },
+                    "body": B64.encode(b"ok"),
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let (status, headers, _) = t.await.unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(headers.get("content-type").map(String::as_str), Some(ct));
+    }
+
+    // 2. Host response within WS limit (512 KiB raw -> ~683 KiB base64 < 2 MiB WS cap) succeeds with 200
+    let target_hid = hid.clone();
+    let t_ok = tokio::spawn(async move {
+        send_http(addr, "POST", &format!("/mcp/{target_hid}"), &[], b"{}").await
+    });
+    let msg = read_json(&mut inbox).await;
+    let ok_payload = vec![b'a'; 512 * 1024];
+    inbox
+        .send(Message::text(
+            json!({
+                "t": "http_res",
+                "id": msg["id"],
+                "status": 200,
+                "headers": { "Content-Type": "application/json" },
+                "body": B64.encode(&ok_payload),
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let (status, _, body) = t_ok.await.unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(body.len(), ok_payload.len());
+
+    // 3. Host response exceeding 2 MiB WS message cap closes Host WS cleanly and returns 504 to HTTP client
+    let target_hid = hid.clone();
+    let t_big = tokio::spawn(async move {
+        send_http(addr, "POST", &format!("/mcp/{target_hid}"), &[], b"{}").await
+    });
+    let msg = read_json(&mut inbox).await;
+    let oversized_b64 = B64.encode(vec![b'x'; 2 * 1024 * 1024 + 1]);
+    let _ = inbox
+        .send(Message::text(
+            json!({
+                "t": "http_res",
+                "id": msg["id"],
+                "status": 200,
+                "headers": { "Content-Type": "application/json" },
+                "body": oversized_b64,
+            })
+            .to_string(),
+        ))
+        .await;
+    let (status, _, _) = t_big.await.unwrap();
+    assert_eq!(status, 504);
+}
+
+#[tokio::test]
+async fn offline_bot_host_returns_503_with_retry_after_and_disabled_returns_404() {
+    let (addr, _) = spawn().await;
+    let host_identity = Identity::generate();
+
+    // 1. Register host with bot: true, then disconnect (simulating Mac sleep / app restart).
+    let (mut inbox, hid) = register_host(addr, &host_identity, true).await;
+    let _ = inbox.close(None).await;
+    // Wait until relay processes unregister.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // 2. OAuth /token and /mcp requests while host is offline return 503 + Retry-After (not 404).
+    let (status_token, headers_token, _) = send_http(
+        addr,
+        "POST",
+        &format!("/mcp/{hid}/token"),
+        &[("Content-Type", "application/x-www-form-urlencoded")],
+        b"grant_type=refresh_token&refresh_token=rtk_test",
+    )
+    .await;
+    assert_eq!(status_token, 503);
+    assert_eq!(
+        headers_token.get("retry-after").map(String::as_str),
+        Some("5")
+    );
+
+    let (status_mcp, headers_mcp, _) = send_http(
+        addr,
+        "POST",
+        &format!("/mcp/{hid}"),
+        &[("Authorization", "Bearer atk_test")],
+        b"{}",
+    )
+    .await;
+    assert_eq!(status_mcp, 503);
+    assert_eq!(
+        headers_mcp.get("retry-after").map(String::as_str),
+        Some("5")
+    );
+
+    // 3. Re-registering with bot: false explicitly disables bot access -> 404.
+    let (_inbox_disabled, _) = register_host(addr, &host_identity, false).await;
+    let (status_disabled, _, _) =
+        send_http(addr, "POST", &format!("/mcp/{hid}/token"), &[], b"{}").await;
+    assert_eq!(status_disabled, 404);
+}
+
+#[tokio::test]
+async fn openai_apps_challenge_reads_env_or_404() {
+    let (addr_unset, _) = spawn().await;
+    let (status, _, _) = send_http(
+        addr_unset,
+        "GET",
+        "/.well-known/openai-apps-challenge",
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(status, 404);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_set = listener.local_addr().unwrap();
+    let state = AppState::new("local", 1024).with_openai_apps_challenge("openai-verify-token-123");
+    tokio::spawn(async move {
+        lumzel_relay::serve(listener, state).await.unwrap();
+    });
+    let (status, headers, body) = send_http(
+        addr_set,
+        "GET",
+        "/.well-known/openai-apps-challenge",
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some("text/plain; charset=utf-8")
+    );
+    assert_eq!(String::from_utf8(body).unwrap(), "openai-verify-token-123");
+}
+
+#[tokio::test]
+async fn single_entry_bearer_prefix_routes_post_mcp_to_matching_host() {
+    let (addr, _) = spawn().await;
+    let host_a = Identity::generate();
+    let host_b = Identity::generate();
+    let (mut inbox_a, hid_a) = register_host(addr, &host_a, true).await;
+    let (mut inbox_b, hid_b) = register_host(addr, &host_b, true).await;
+
+    let tok_a = format!("lzm_{hid_a}.atk_secret_a");
+    let tok_b = format!("lzm_{hid_b}.atk_secret_b");
+
+    // Request with host_a prefix hits inbox_a
+    let client_a = tokio::spawn({
+        let tok_a = tok_a.clone();
+        async move {
+            send_http(
+                addr,
+                "POST",
+                "/mcp",
+                &[
+                    ("Authorization", &format!("Bearer {tok_a}")),
+                    ("Content-Type", "application/json"),
+                ],
+                br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+            )
+            .await
+        }
+    });
+    let msg_a = read_json(&mut inbox_a).await;
+    assert_eq!(msg_a["t"], "http");
+    assert_eq!(msg_a["path"], "/mcp");
+    let req_id_a = msg_a["id"].as_u64().unwrap();
+    inbox_a
+        .send(Message::text(
+            json!({
+                "t": "http_res",
+                "id": req_id_a,
+                "status": 200,
+                "headers": {"Content-Type": "application/json"},
+                "body": B64.encode(br#"{"host":"a"}"#),
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let (st_a, _, body_a) = client_a.await.unwrap();
+    assert_eq!(st_a, 200);
+    assert_eq!(String::from_utf8(body_a).unwrap(), r#"{"host":"a"}"#);
+
+    // Request with host_b prefix hits inbox_b
+    let client_b = tokio::spawn({
+        let tok_b = tok_b.clone();
+        async move {
+            send_http(
+                addr,
+                "POST",
+                "/mcp",
+                &[
+                    ("Authorization", &format!("Bearer {tok_b}")),
+                    ("Content-Type", "application/json"),
+                ],
+                br#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#,
+            )
+            .await
+        }
+    });
+    let msg_b = read_json(&mut inbox_b).await;
+    assert_eq!(msg_b["t"], "http");
+    assert_eq!(msg_b["path"], "/mcp");
+    let req_id_b = msg_b["id"].as_u64().unwrap();
+    inbox_b
+        .send(Message::text(
+            json!({
+                "t": "http_res",
+                "id": req_id_b,
+                "status": 200,
+                "headers": {"Content-Type": "application/json"},
+                "body": B64.encode(br#"{"host":"b"}"#),
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let (st_b, _, body_b) = client_b.await.unwrap();
+    assert_eq!(st_b, 200);
+    assert_eq!(String::from_utf8(body_b).unwrap(), r#"{"host":"b"}"#);
+
+    // Tampered prefix routes to host_b, which rejects with 401
+    let tampered = format!("lzm_{hid_b}.atk_secret_a");
+    let client_tampered = tokio::spawn(async move {
+        send_http(
+            addr,
+            "POST",
+            "/mcp",
+            &[("Authorization", &format!("Bearer {tampered}"))],
+            b"{}",
+        )
+        .await
+    });
+    let msg_tampered = read_json(&mut inbox_b).await;
+    let req_id_t = msg_tampered["id"].as_u64().unwrap();
+    inbox_b
+        .send(Message::text(
+            json!({
+                "t": "http_res",
+                "id": req_id_t,
+                "status": 401,
+                "headers": {"Content-Type": "application/json"},
+                "body": B64.encode(br#"{"error":"unauthorized"}"#),
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let (st_t, _, _) = client_tampered.await.unwrap();
+    assert_eq!(st_t, 401);
+}
+
+#[tokio::test]
+async fn single_entry_unauthenticated_post_mcp_and_stateless_oauth_full_flow() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = AppState::new("local", 1024).with_public_url(format!("http://{addr}"));
+    tokio::spawn(async move {
+        lumzel_relay::serve(listener, state).await.unwrap();
+    });
+
+    let host = Identity::generate();
+    let (mut inbox, hid) = register_host(addr, &host, true).await;
+
+    // 1. Unauthenticated POST /mcp -> 401 pointing to root .well-known
+    let (st, hdrs, _) = send_http(addr, "POST", "/mcp", &[], b"{}").await;
+    assert_eq!(st, 401);
+    assert_eq!(
+        hdrs.get("www-authenticate").map(String::as_str),
+        Some(
+            format!(
+                r#"Bearer resource_metadata="http://{addr}/.well-known/oauth-protected-resource""#
+            )
+            .as_str()
+        )
+    );
+
+    // 2. Root well-known metadata
+    let (st, _, body) = send_http(
+        addr,
+        "GET",
+        "/.well-known/oauth-protected-resource",
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(st, 200);
+    let pr: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(pr["resource"], format!("http://{addr}/mcp"));
+    assert!(pr["scopes_supported"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s == "workflows"));
+
+    let (st, _, body) = send_http(
+        addr,
+        "GET",
+        "/.well-known/oauth-authorization-server",
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(st, 200);
+    let as_meta: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        as_meta["registration_endpoint"],
+        format!("http://{addr}/oauth/register")
+    );
+
+    // 3. Stateless DCR POST /oauth/register
+    let (st, _, body) = send_http(
+        addr,
+        "POST",
+        "/oauth/register",
+        &[("Content-Type", "application/json")],
+        br#"{"client_name":"ChatGPT","redirect_uris":["https://chatgpt.com/connector/oauth/cb"]}"#,
+    )
+    .await;
+    assert_eq!(st, 201);
+    let reg: Value = serde_json::from_slice(&body).unwrap();
+    let client_id = reg["client_id"].as_str().unwrap().to_owned();
+    assert!(client_id.starts_with("lzc_"));
+
+    // 4. GET /oauth/authorize without host -> CSP host selection page
+    let (st, hdrs, body) = send_http(
+        addr,
+        "GET",
+        &format!(
+            "/oauth/authorize?client_id={client_id}&redirect_uri=https://chatgpt.com/connector/oauth/cb&code_challenge=abc&code_challenge_method=S256"
+        ),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert!(hdrs.contains_key("content-security-policy"));
+    let html = String::from_utf8(body).unwrap();
+    assert!(html.contains("Host ID"));
+
+    // 5. GET /oauth/authorize with ?host=<hid> verifies lzc_ & strips spoofed x-lumzel-* headers
+    let auth_task = tokio::spawn({
+        let client_id = client_id.clone();
+        let hid = hid.clone();
+        async move {
+            send_http(
+                addr,
+                "GET",
+                &format!(
+                    "/oauth/authorize?host={hid}&client_id={client_id}&redirect_uri=https://chatgpt.com/connector/oauth/cb&code_challenge=abc&code_challenge_method=S256"
+                ),
+                &[("X-Lumzel-Dcr-Client", "spoofed")],
+                b"",
+            )
+            .await
+        }
+    });
+    let msg = read_json(&mut inbox).await;
+    assert_eq!(msg["path"], "/oauth/authorize");
+    let dcr_hdr = msg["headers"]["x-lumzel-dcr-client"]
+        .as_str()
+        .expect("Relay must inject verified x-lumzel-dcr-client");
+    assert_ne!(dcr_hdr, "spoofed");
+    let decoded_dcr: Value = serde_json::from_slice(&B64.decode(dcr_hdr).unwrap()).unwrap();
+    assert_eq!(decoded_dcr["client_name"], "ChatGPT");
+
+    let req_id = msg["id"].as_u64().unwrap();
+    inbox
+        .send(Message::text(
+            json!({
+                "t": "http_res",
+                "id": req_id,
+                "status": 200,
+                "headers": {"Content-Type": "application/json"},
+                "body": B64.encode(
+                    json!({
+                        "request": format!("lzm_{hid}.req_123"),
+                        "host_name": "Mac",
+                        "user_code": "654321"
+                    })
+                    .to_string(),
+                ),
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let (st, _, body) = auth_task.await.unwrap();
+    assert_eq!(st, 200);
+    assert!(String::from_utf8(body).unwrap().contains("654321"));
+}
+
+#[tokio::test]
+async fn legacy_host_path_and_legacy_unprefixed_tokens_remain_100_percent_compatible() {
+    let (addr, _) = spawn().await;
+    let host_identity = Identity::generate();
+    let (mut inbox, hid) = register_host(addr, &host_identity, true).await;
+
+    let legacy_task = tokio::spawn({
+        let hid = hid.clone();
+        async move {
+            send_http(
+                addr,
+                "POST",
+                &format!("/mcp/{hid}"),
+                &[("Authorization", "Bearer atk_legacy_unprefixed_token")],
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            )
+            .await
+        }
+    });
+    let msg = read_json(&mut inbox).await;
+    assert_eq!(msg["path"], format!("/mcp/{hid}"));
+    assert_eq!(
+        msg["headers"]["authorization"],
+        "Bearer atk_legacy_unprefixed_token"
+    );
+    let req_id = msg["id"].as_u64().unwrap();
+    inbox
+        .send(Message::text(
+            json!({
+                "t": "http_res",
+                "id": req_id,
+                "status": 200,
+                "headers": {"Content-Type": "application/json"},
+                "body": B64.encode(br#"{"ok":true}"#),
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let (st, _, body) = legacy_task.await.unwrap();
+    assert_eq!(st, 200);
+    assert_eq!(String::from_utf8(body).unwrap(), r#"{"ok":true}"#);
+}
+
+#[tokio::test]
+async fn untrusted_x_forwarded_host_and_header_injection_are_ignored() {
+    let (addr, _) = spawn().await;
+
+    // Untrusted peer tries to poison OAuth discovery and inject quotes into WWW-Authenticate.
+    let (st, hdrs, _) = send_http(
+        addr,
+        "POST",
+        "/mcp",
+        &[
+            ("X-Forwarded-Host", "evil.example.com\", injected=\"1"),
+            ("X-Forwarded-Proto", "https"),
+        ],
+        b"{}",
+    )
+    .await;
+    assert_eq!(st, 401);
+    let www_auth = hdrs.get("www-authenticate").unwrap();
+    assert!(
+        !www_auth.contains("evil.example.com") && !www_auth.contains("injected="),
+        "untrusted X-Forwarded-Host must be ignored: {www_auth}"
+    );
+    assert!(www_auth.contains(&format!(
+        "http://{addr}/.well-known/oauth-protected-resource"
+    )));
+
+    let (st2, _, body2) = send_http(
+        addr,
+        "GET",
+        "/.well-known/oauth-authorization-server",
+        &[("X-Forwarded-Host", "evil.example.com")],
+        b"",
+    )
+    .await;
+    assert_eq!(st2, 200);
+    let meta: Value = serde_json::from_slice(&body2).unwrap();
+    assert_eq!(meta["issuer"], format!("http://{addr}"));
+}

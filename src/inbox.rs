@@ -33,12 +33,22 @@ const MAX_TICKETS: usize = 16_384;
 const MAX_TICKETS_PER_HOST: usize = 128;
 const MAX_PENDING_HTTP_PER_HOST: usize = 64;
 const MAX_HOST_OUTBOX: usize = 256;
+const MAX_RECENT_BOT_HOSTS: usize = 16_384;
+const RECENT_BOT_HOST_TTL: Duration = Duration::from_secs(7 * 86400);
 pub(crate) const MAX_HOST_WS_MSG: usize = 2 * 1024 * 1024;
 const MAX_RES_HEADERS: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BotHostStatus {
+    Ready,
+    Offline,
+    NotFound,
+}
 
 #[derive(Debug)]
 pub(crate) enum HttpDispatchError {
     NotFound,
+    Offline,
     Unavailable,
     Busy,
 }
@@ -71,6 +81,7 @@ pub(crate) struct InboxRegistry {
     next_seq: u64,
     next_http_id: u64,
     hosts: HashMap<String, HostEntry>,
+    recently_bot_hosts: HashMap<String, Instant>,
     tickets: HashMap<String, TicketEntry>,
     http_host: HashMap<u64, String>,
 }
@@ -80,8 +91,42 @@ impl InboxRegistry {
         self.hosts.contains_key(host)
     }
 
-    pub(crate) fn is_bot_enabled(&self, host: &str) -> bool {
-        self.hosts.get(host).is_some_and(|h| h.bot)
+    pub(crate) fn bot_host_status(&mut self, host: &str) -> BotHostStatus {
+        if let Some(entry) = self.hosts.get(host) {
+            return if entry.bot {
+                BotHostStatus::Ready
+            } else {
+                BotHostStatus::NotFound
+            };
+        }
+        let now = Instant::now();
+        if let Some(&seen) = self.recently_bot_hosts.get(host) {
+            if now.saturating_duration_since(seen) <= RECENT_BOT_HOST_TTL {
+                return BotHostStatus::Offline;
+            }
+            self.recently_bot_hosts.remove(host);
+        }
+        BotHostStatus::NotFound
+    }
+
+    fn record_recent_bot_host(&mut self, host: String, now: Instant) {
+        if !self.recently_bot_hosts.contains_key(&host)
+            && self.recently_bot_hosts.len() >= MAX_RECENT_BOT_HOSTS
+        {
+            self.recently_bot_hosts
+                .retain(|_, seen| now.saturating_duration_since(*seen) <= RECENT_BOT_HOST_TTL);
+            if self.recently_bot_hosts.len() >= MAX_RECENT_BOT_HOSTS {
+                if let Some(oldest) = self
+                    .recently_bot_hosts
+                    .iter()
+                    .min_by_key(|(_, seen)| *seen)
+                    .map(|(k, _)| k.clone())
+                {
+                    self.recently_bot_hosts.remove(&oldest);
+                }
+            }
+        }
+        self.recently_bot_hosts.insert(host, now);
     }
 
     pub(crate) fn register(
@@ -93,6 +138,11 @@ impl InboxRegistry {
     ) -> u64 {
         self.next_seq = self.next_seq.saturating_add(1);
         let seq = self.next_seq;
+        if bot {
+            self.record_recent_bot_host(host.clone(), Instant::now());
+        } else {
+            self.recently_bot_hosts.remove(&host);
+        }
         if let Some(previous) = self.hosts.insert(
             host,
             HostEntry {
@@ -120,10 +170,12 @@ impl InboxRegistry {
         headers: HashMap<String, String>,
         body: String,
     ) -> Result<(u64, tokio::sync::oneshot::Receiver<ProxiedHttpRes>), HttpDispatchError> {
-        let entry = self
-            .hosts
-            .get_mut(host)
-            .ok_or(HttpDispatchError::NotFound)?;
+        let Some(entry) = self.hosts.get_mut(host) else {
+            return match self.bot_host_status(host) {
+                BotHostStatus::Offline => Err(HttpDispatchError::Offline),
+                _ => Err(HttpDispatchError::NotFound),
+            };
+        };
         if !entry.bot {
             return Err(HttpDispatchError::NotFound);
         }
@@ -180,6 +232,9 @@ impl InboxRegistry {
     pub(crate) fn unregister(&mut self, host: &str, seq: u64) {
         if self.hosts.get(host).is_some_and(|entry| entry.seq == seq) {
             if let Some(removed) = self.hosts.remove(host) {
+                if removed.bot {
+                    self.record_recent_bot_host(host.to_owned(), Instant::now());
+                }
                 for id in removed.pending_http.keys() {
                     self.http_host.remove(id);
                 }
@@ -327,11 +382,14 @@ async fn run_inbox(mut socket: WebSocket, state: AppState, ip_permit: SharedIpPe
     })
     .to_string();
 
-    if socket
-        .send(Message::Text(challenge_msg.into()))
-        .await
-        .is_err()
-    {
+    if !matches!(
+        tokio::time::timeout(
+            REGISTER_TIMEOUT,
+            socket.send(Message::Text(challenge_msg.into())),
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
         return;
     }
 
@@ -482,7 +540,11 @@ async fn recv_register(socket: &mut WebSocket) -> Option<Result<String, ()>> {
         match next {
             Ok(Message::Text(text)) => return Some(Ok(text.to_string())),
             Ok(Message::Ping(payload)) => {
-                if socket.send(Message::Pong(payload)).await.is_err() {
+                if !matches!(
+                    tokio::time::timeout(REGISTER_TIMEOUT, socket.send(Message::Pong(payload)),)
+                        .await,
+                    Ok(Ok(()))
+                ) {
                     return None;
                 }
             }

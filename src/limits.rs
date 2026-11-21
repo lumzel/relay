@@ -175,18 +175,22 @@ impl Limits {
         self.config.idle_timeout
     }
 
+    pub(crate) fn is_trusted_proxy(&self, peer: Option<IpAddr>) -> bool {
+        let Some(raw) = peer else {
+            return false;
+        };
+        let ip = canonical_ip(raw);
+        self.config
+            .trusted_proxies
+            .iter()
+            .any(|proxy| canonical_ip(*proxy) == ip)
+    }
+
     pub(crate) fn resolve_client_ip(&self, peer: Option<IpAddr>, headers: &HeaderMap) -> IpAddr {
         let tcp_ip = peer
             .map(canonical_ip)
             .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-        let is_trusted = |ip: IpAddr| {
-            let ip = canonical_ip(ip);
-            self.config
-                .trusted_proxies
-                .iter()
-                .any(|proxy| canonical_ip(*proxy) == ip)
-        };
-        if !is_trusted(tcp_ip) {
+        if !self.is_trusted_proxy(Some(tcp_ip)) {
             return tcp_ip;
         }
         if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
@@ -197,7 +201,7 @@ impl Limits {
                 };
                 let ip = canonical_ip(parsed);
                 last_valid = Some(ip);
-                if !is_trusted(ip) {
+                if !self.is_trusted_proxy(Some(ip)) {
                     return ip;
                 }
             }
